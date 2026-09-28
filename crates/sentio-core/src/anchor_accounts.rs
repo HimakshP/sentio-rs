@@ -288,6 +288,25 @@ impl AnchorFieldConstraints {
                 })
         })
     }
+
+    /// True when the field has an explicit fixed-identity constraint.
+    ///
+    /// This is intentionally narrower than `has_owner_or_address_check()`:
+    /// `constraint = account.key() == other_account.key()` is an identity
+    /// comparison, but does not establish that `account` is pinned to a trusted
+    /// fixed identity.
+    pub fn has_fixed_identity_check(&self) -> bool {
+        if self.address {
+            return true;
+        }
+
+        self.items.iter().any(|c| {
+            c.kind == AnchorConstraintKind::Constraint
+                && c.value
+                    .as_deref()
+                    .is_some_and(constraint_expr_checks_fixed_identity)
+        })
+    }
 }
 
 /// `foo.mint == bar.mint` / `foo.mint == mint.key()` style checks.
@@ -320,6 +339,38 @@ fn normalize_constraint_expr(expr: &str) -> String {
         .filter(|c| !c.is_whitespace())
         .collect::<String>()
         .to_ascii_lowercase()
+}
+
+fn constraint_expr_checks_fixed_identity(expr: &str) -> bool {
+    let n = normalize_constraint_expr(expr);
+
+    n.split("||").flat_map(|part| part.split("&&")).any(|part| {
+        let Some(eq_pos) = part.find("==") else {
+            return false;
+        };
+
+        let lhs = &part[..eq_pos];
+        let rhs = &part[eq_pos + 2..];
+
+        fn is_key_expr(value: &str) -> bool {
+            value.ends_with(".key()")
+        }
+
+        fn is_fixed_identity_expr(value: &str) -> bool {
+            if value.ends_with(".key()") {
+                return false;
+            }
+
+            // Fixed module/constant identity:
+            // crate::admin::ID
+            // crate::create_permission_pda_owner::ID
+            // admin::ID
+            value.ends_with("::id")
+        }
+
+        (is_key_expr(lhs) && is_fixed_identity_expr(rhs))
+            || (is_fixed_identity_expr(lhs) && is_key_expr(rhs))
+    })
 }
 
 // function related to constraints

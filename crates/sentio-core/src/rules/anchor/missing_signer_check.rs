@@ -47,7 +47,7 @@ impl Rule for MissingSignerCheckRule {
             let mut signer_guarded_tokens = ctx.global.signer_guard_tokens_for(struct_name);
             signer_guarded_tokens.extend(local_signer_tokens.iter().cloned());
 
-            for field in item.fields {
+            for field in &item.fields {
                 let kind = &field.type_info.kind;
 
                 if *kind != AnchorFieldTypeKind::AccountInfo
@@ -95,6 +95,22 @@ impl Rule for MissingSignerCheckRule {
                 // Require !mut so we don't suppress accounts that can still be mutated.
                 if !c.is_mut
                     && analyze_account_field_usage(&file.syntax, &field_name).is_pubkey_only()
+                {
+                    continue;
+                }
+
+                let has_fixed_identity_signer = item.fields.iter().any(|candidate| {
+                    let Some(candidate_name) = candidate.ast.name.as_deref() else {
+                        return false;
+                    };
+
+                    candidate_name != field_name
+                        && candidate.type_info.kind == AnchorFieldTypeKind::Signer
+                        && candidate.constraints.has_fixed_identity_check()
+                });
+
+                if has_fixed_identity_signer
+                    && analyze_account_field_usage(&file.syntax, &field_name).is_identity_only()
                 {
                     continue;
                 }
@@ -426,5 +442,188 @@ mod tests {
         let findings = rule.match_file(&files[0], &ctx);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].rule_id, "SW001");
+    }
+
+    #[test]
+    fn flags_identity_only_authority_without_fixed_identity_signer() {
+        let source = r#"
+        use anchor_lang::prelude::*;
+
+        #[derive(Accounts)]
+        pub struct Deposit<'info> {
+            #[account(
+                mut,
+                seeds = [b"vault", permission_authority.key().as_ref()],
+                bump
+            )]
+            pub vault: Account<'info, Vault>,
+
+            pub permission_authority: UncheckedAccount<'info>,
+        }
+
+        #[account]
+        pub struct Vault {
+            pub balance: u64,
+        }
+
+        pub fn deposit(ctx: Context<Deposit>) {
+            let _ = ctx.accounts.permission_authority.key();
+        }
+    "#;
+
+        let file = parse_file(source);
+        let rule = MissingSignerCheckRule;
+        let findings =
+            rule.match_file(&file, &RuleContext::files_only(std::slice::from_ref(&file)));
+
+        assert!(
+            findings.iter().any(|finding| finding.rule_id == "SW001"),
+            "identity-only authority without an independently fixed signer must remain flagged"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_identity_only_authority_with_fixed_identity_signer() {
+        let source = r#"
+        use anchor_lang::prelude::*;
+
+        pub mod admin {
+            use super::*;
+            pub const ID: Pubkey = pubkey!("11111111111111111111111111111111");
+        }
+
+        #[derive(Accounts)]
+        pub struct Deposit<'info> {
+            #[account(
+                mut,
+                seeds = [b"vault", permission_authority.key().as_ref()],
+                bump
+            )]
+            pub vault: Account<'info, Vault>,
+
+            pub permission_authority: UncheckedAccount<'info>,
+
+            #[account(address = crate::admin::ID)]
+            pub admin: Signer<'info>,
+        }
+
+        #[account]
+        pub struct Vault {
+            pub balance: u64,
+        }
+
+        pub fn deposit(ctx: Context<Deposit>) {
+            let _ = ctx.accounts.permission_authority.key();
+            let _ = ctx.accounts.admin.key();
+        }
+    "#;
+
+        let file = parse_file(source);
+        let rule = MissingSignerCheckRule;
+        let findings =
+            rule.match_file(&file, &RuleContext::files_only(std::slice::from_ref(&file)));
+
+        assert!(
+        findings.iter().all(|finding| finding.rule_id != "SW001"),
+        "identity-only authority should not be flagged when an independent fixed-identity signer exists"
+    );
+    }
+
+    #[test]
+    fn flags_identity_only_authority_when_other_signer_is_not_fixed_identity() {
+        let source = r#"
+        use anchor_lang::prelude::*;
+
+        #[derive(Accounts)]
+        pub struct Deposit<'info> {
+            #[account(
+                mut,
+                seeds = [b"vault", permission_authority.key().as_ref()],
+                bump
+            )]
+            pub vault: Account<'info, Vault>,
+
+            pub permission_authority: UncheckedAccount<'info>,
+
+            pub admin: Signer<'info>,
+        }
+
+        #[account]
+        pub struct Vault {
+            pub balance: u64,
+        }
+
+        pub fn deposit(ctx: Context<Deposit>) {
+            let _ = ctx.accounts.permission_authority.key();
+            let _ = ctx.accounts.admin.key();
+        }
+    "#;
+
+        let file = parse_file(source);
+        let rule = MissingSignerCheckRule;
+        let findings =
+            rule.match_file(&file, &RuleContext::files_only(std::slice::from_ref(&file)));
+
+        assert!(
+            findings.iter().any(|finding| finding.rule_id == "SW001"),
+            "an unrelated dynamic signer must not suppress the missing-signer finding"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_identity_only_authority_with_multiple_fixed_identity_signers() {
+        let source = r#"
+        use anchor_lang::prelude::*;
+
+        pub mod admin {
+            use super::*;
+            pub const ID: Pubkey = pubkey!("11111111111111111111111111111111");
+        }
+
+        pub mod create_permission_pda_owner {
+            use super::*;
+            pub const ID: Pubkey = pubkey!("11111111111111111111111111111111");
+        }
+
+        #[derive(Accounts)]
+        pub struct ClosePermissionPda<'info> {
+            #[account(
+                mut,
+                seeds = [b"permission", permission_authority.key().as_ref()],
+                bump
+            )]
+            pub permission_pda: Account<'info, PermissionPda>,
+
+            pub permission_authority: UncheckedAccount<'info>,
+
+            #[account(
+                constraint = (
+                    owner.key() == crate::admin::ID
+                    || owner.key() == crate::create_permission_pda_owner::ID
+                )
+            )]
+            pub owner: Signer<'info>,
+        }
+
+        #[account]
+        pub struct PermissionPda {
+            pub value: u64,
+        }
+
+        pub fn close(ctx: Context<ClosePermissionPda>) {
+            let _ = ctx.accounts.permission_authority.key();
+            let _ = ctx.accounts.owner.key();
+        }
+    "#;
+
+        let file = parse_file(source);
+        let rule = MissingSignerCheckRule;
+        let findings =
+            rule.match_file(&file, &RuleContext::files_only(std::slice::from_ref(&file)));
+
+        assert!(
+            findings.iter().all(|finding| finding.rule_id != "SW001"),
+            "multiple fixed identities in an OR constraint should count as fixed signer validation"
+        );
     }
 }

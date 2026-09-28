@@ -2,6 +2,7 @@ use crate::anchor_accounts::{
     collect_anchor_accounts_index, AnchorConstraintKind, AnchorFieldTypeKind,
 };
 use crate::finding::SourceLocation;
+use crate::instruction_analysis::analyze_account_field_usage;
 use crate::rules::{Rule, RuleContext, RuleMatch, RuleMetadata, RuleSeverity};
 use crate::syntax::ParsedFile;
 
@@ -61,6 +62,7 @@ impl Rule for PdaSeedUnvalidatedAccountRule {
                         other.type_info.kind,
                         AnchorFieldTypeKind::AccountInfo | AnchorFieldTypeKind::UncheckedAccount
                     );
+
                     let has_validation = other.constraints.owner
                         || other.constraints.address
                         || other.constraints.is_signer
@@ -69,7 +71,23 @@ impl Rule for PdaSeedUnvalidatedAccountRule {
                             AnchorFieldTypeKind::Signer | AnchorFieldTypeKind::Program
                         );
 
-                    if unverified && !has_validation {
+                    let other_is_identity_only =
+                        analyze_account_field_usage(&file.syntax, &other_name).is_identity_only();
+
+                    let has_fixed_identity_signer = item.fields.iter().any(|candidate| {
+                        let Some(candidate_name) = candidate.ast.name.as_deref() else {
+                            return false;
+                        };
+
+                        candidate_name != other_name
+                            && candidate.type_info.kind == AnchorFieldTypeKind::Signer
+                            && candidate.constraints.has_fixed_identity_check()
+                    });
+
+                    let identity_only_with_fixed_signer =
+                        other_is_identity_only && has_fixed_identity_signer;
+
+                    if unverified && !has_validation && !identity_only_with_fixed_signer {
                         let pda_name = pda_field.ast.name.clone().unwrap_or_default();
                         findings.push(RuleMatch {
                             rule_id: "SW013",
@@ -199,5 +217,190 @@ mod tests {
         let findings =
             rule.match_file(&file, &RuleContext::files_only(std::slice::from_ref(&file)));
         assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn flags_identity_only_seed_account_without_fixed_identity_signer() {
+        let file = parse_file(
+            r#"
+        use anchor_lang::prelude::*;
+
+        #[derive(Accounts)]
+        pub struct Create<'info> {
+            pub permission_authority: UncheckedAccount<'info>,
+
+            #[account(
+                seeds = [b"vault", permission_authority.key().as_ref()],
+                bump
+            )]
+            pub vault: Account<'info, Vault>,
+        }
+
+        #[account]
+        pub struct Vault {
+            pub balance: u64,
+        }
+
+        pub fn create(ctx: Context<Create>) -> Result<()> {
+            let _ = ctx.accounts.permission_authority.key();
+            Ok(())
+        }
+    "#,
+        );
+
+        let rule = PdaSeedUnvalidatedAccountRule;
+        let findings =
+            rule.match_file(&file, &RuleContext::files_only(std::slice::from_ref(&file)));
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "SW013");
+    }
+
+    #[test]
+    fn does_not_flag_identity_only_seed_account_with_fixed_identity_signer() {
+        let file = parse_file(
+            r#"
+        use anchor_lang::prelude::*;
+
+        pub mod admin {
+            use super::*;
+            pub const ID: Pubkey = pubkey!("11111111111111111111111111111111");
+        }
+
+        #[derive(Accounts)]
+        pub struct Create<'info> {
+            pub permission_authority: UncheckedAccount<'info>,
+
+            #[account(address = crate::admin::ID)]
+            pub admin: Signer<'info>,
+
+            #[account(
+                seeds = [b"vault", permission_authority.key().as_ref()],
+                bump
+            )]
+            pub vault: Account<'info, Vault>,
+        }
+
+        #[account]
+        pub struct Vault {
+            pub balance: u64,
+        }
+
+        pub fn create(ctx: Context<Create>) -> Result<()> {
+            let _ = ctx.accounts.permission_authority.key();
+            let _ = ctx.accounts.admin.key();
+            Ok(())
+        }
+    "#,
+        );
+
+        let rule = PdaSeedUnvalidatedAccountRule;
+        let findings =
+            rule.match_file(&file, &RuleContext::files_only(std::slice::from_ref(&file)));
+
+        assert!(
+        findings.is_empty(),
+        "identity-only seed account with a fixed-identity signer must not be flagged: {findings:?}"
+    );
+    }
+
+    #[test]
+    fn flags_identity_only_seed_account_with_unconstrained_signer() {
+        let file = parse_file(
+            r#"
+        use anchor_lang::prelude::*;
+
+        #[derive(Accounts)]
+        pub struct Create<'info> {
+            pub permission_authority: UncheckedAccount<'info>,
+
+            pub admin: Signer<'info>,
+
+            #[account(
+                seeds = [b"vault", permission_authority.key().as_ref()],
+                bump
+            )]
+            pub vault: Account<'info, Vault>,
+        }
+
+        #[account]
+        pub struct Vault {
+            pub balance: u64,
+        }
+
+        pub fn create(ctx: Context<Create>) -> Result<()> {
+            let _ = ctx.accounts.permission_authority.key();
+            let _ = ctx.accounts.admin.key();
+            Ok(())
+        }
+    "#,
+        );
+
+        let rule = PdaSeedUnvalidatedAccountRule;
+        let findings =
+            rule.match_file(&file, &RuleContext::files_only(std::slice::from_ref(&file)));
+
+        assert!(
+            findings.iter().any(|finding| finding.rule_id == "SW013"),
+            "an unrelated unconstrained signer must not suppress SW013"
+        );
+    }
+
+    #[test]
+    fn does_not_flag_identity_only_seed_account_with_multiple_fixed_identity_signers() {
+        let file = parse_file(
+            r#"
+        use anchor_lang::prelude::*;
+
+        pub mod admin {
+            use super::*;
+            pub const ID: Pubkey = pubkey!("11111111111111111111111111111111");
+        }
+
+        pub mod create_permission_pda_owner {
+            use super::*;
+            pub const ID: Pubkey = pubkey!("11111111111111111111111111111111");
+        }
+
+        #[derive(Accounts)]
+        pub struct Create<'info> {
+            pub permission_authority: UncheckedAccount<'info>,
+
+            #[account(
+                constraint = (
+                    owner.key() == crate::admin::ID
+                    || owner.key() == crate::create_permission_pda_owner::ID
+                )
+            )]
+            pub owner: Signer<'info>,
+
+            #[account(
+                seeds = [b"vault", permission_authority.key().as_ref()],
+                bump
+            )]
+            pub vault: Account<'info, Vault>,
+        }
+
+        #[account]
+        pub struct Vault {
+            pub balance: u64,
+        }
+
+        pub fn create(ctx: Context<Create>) -> Result<()> {
+            let _ = ctx.accounts.permission_authority.key();
+            let _ = ctx.accounts.owner.key();
+            Ok(())
+        }
+    "#,
+        );
+
+        let rule = PdaSeedUnvalidatedAccountRule;
+        let findings =
+            rule.match_file(&file, &RuleContext::files_only(std::slice::from_ref(&file)));
+
+        assert!(
+        findings.is_empty(),
+        "multiple fixed identities in an OR constraint must count as fixed signer validation: {findings:?}"
+    );
     }
 }
