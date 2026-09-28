@@ -17,6 +17,8 @@ Changes on `main` since **0.3.2** (not yet cut as a crates.io release):
 
 ### Added
 - CONTRIBUTING — verified commits, pre-push `fmt` / `clippy` / `test` / `audit`
+- **SECURITY.md** — vulnerability reporting policy — [#16](https://github.com/sentio-security/sentio-rs/issues/16)
+- **CHANGELOG.md** — Keep a Changelog + SemVer; severity shifts documented (rule severity feeds `--fail-on`) — [#17](https://github.com/sentio-security/sentio-rs/issues/17)
 
 ### Fixed
 - **GlobalIndex** scoped per Anchor program (same-named Accounts across programs no longer merge) — [#8](https://github.com/sentio-security/sentio-rs/issues/8)
@@ -24,6 +26,9 @@ Changes on `main` since **0.3.2** (not yet cut as a crates.io release):
 - Human report write errors propagated; `BrokenPipe` treated as success — [#11](https://github.com/sentio-security/sentio-rs/issues/11)
 - MSRV pinned to **Rust 1.85** — [#10](https://github.com/sentio-security/sentio-rs/issues/10)
 - `rustls` ≥ 0.23.45 (RUSTSEC-2026-0285)
+- **SW023** — a CPI is reported only when one of its arguments carries `remaining_accounts` (or a local assigned / `extend`ed from it); a `remaining_accounts` read beside an unrelated CPI no longer flags — [#20](https://github.com/sentio-security/sentio-rs/issues/20)
+- **SW025** — `#[cfg(test)]` modules and functions are skipped like `#[test]` (incl. `all(test, …)` / `any(test, …)`); `#[cfg(not(test))]` stays in the scan — [#20](https://github.com/sentio-security/sentio-rs/issues/20)
+- **SW009 / SW010** — quiet `mut` token accounts whose identity/owner is already pinned by an Anchor constraint (`address`, `owner`, `constraint = token.key() == …`, `constraint = token.owner == …`); unconstrained accounts still reported — [#23](https://github.com/sentio-security/sentio-rs/issues/23)
 
 ### Changed
 - Precision / FP reductions (in git; upgrade from crates.io 0.3.2 via git/`main` until the next release):
