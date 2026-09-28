@@ -24,6 +24,11 @@ Using `UncheckedAccount` is allowed. Sentio flags **missing visible guards** (ow
 - **Still flagged:** data use (e.g. `try_borrow_data`) with no owner/address guard
 - **Not auto-trusted:** “integrity comes from a ZK proof” without a check we can parse
 
+## SW025 guard analysis
+
+- **Mutation through `&mut self` methods is invisible.** Passing `&mut x` to a function is treated as a mutation, but a method call like `x.normalize()` that takes `&mut self` cannot be recognized without type resolution. A guard established before such a call survives it; if the method can set `x` back to `None`, the unwrap is not reported. Method names `take` / `replace` / `swap` are handled explicitly.
+- **Slice length bounds are file-wide, not per variable.** A `require!(x.len() >= …)` lowers the length floor for every `.get(N)` / `.last()` in the file — Anchor's `remaining_accounts` convention usually means one invariant, but a file with two independent slices of different lengths can quiet an out-of-bounds unwrap on the shorter one. The smallest bound in the file wins, so a stronger require never quiets an index past a weaker one.
+
 ## False positives
 
 Report with rule id + snippet: GitHub issues or Discord `#false-positives`. Prefer a PR with a regression fixture when fixing FPs.

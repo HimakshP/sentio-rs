@@ -4,8 +4,13 @@ mod common;
 fn sw025_flags_risky_fixture() {
     let result = common::scan_fixture("sw025/risky.rs", "SW025");
 
-    assert_eq!(result.findings.len(), 1);
-    assert_eq!(result.findings[0].rule_id, "SW025");
+    assert_eq!(
+        result.findings.len(),
+        4,
+        "unguarded try_into, unguarded Option unwrap, get at the len floor, unwrap after &mut pass: {:?}",
+        result.findings
+    );
+    assert!(result.findings.iter().all(|f| f.rule_id == "SW025"));
 }
 
 #[test]
