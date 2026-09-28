@@ -29,6 +29,7 @@ Changes on `main` since **0.3.2** (not yet cut as a crates.io release):
 - Precision / FP reductions (in git; upgrade from crates.io 0.3.2 via git/`main` until the next release):
   - **SW003** — quiet CPI when target is typed `Program<'info, T>` (still flags unvalidated `*program*` AccountInfo)
   - **SW025** — quiet `Pubkey::create_*` / fixed-layout `try_to_vec` unwraps
+  - **SW025** — quiet unwraps that cannot panic: `require!(x.is_some())` / `is_none()` early-exit / `else` of `is_none()` / `is_some() &&` short-circuit in the same block or under the same `if` condition as the require, and slice `.get(N)` / `.last()` proven in-bounds by a same-file length require. Proofs are dropped when the receiver is mutated (assignment, `take`/`replace`/`swap`, `mem::*`, `&mut` argument pass, deref assign) — [#30](https://github.com/sentio-security/sentio-rs/issues/30)
   - **SW010** — quiet user mint/burn endpoints when mint is pinned (vault/`from` still flagged)
 
 ---
