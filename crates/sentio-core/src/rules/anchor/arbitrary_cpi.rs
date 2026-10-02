@@ -471,109 +471,97 @@ fn all_call_sites_pass(
     }
     let mut saw = false;
     let mut ok = true;
+    let mut walker = CallSiteWalker {
+        ctx,
+        callee,
+        param_index,
+        arity,
+        stack,
+        saw: &mut saw,
+        ok: &mut ok,
+    };
+
     for file in ctx.files {
-        walk_items_for_calls(
-            ctx,
-            &file.syntax.items,
-            callee,
-            param_index,
-            arity,
-            stack,
-            &mut saw,
-            &mut ok,
-        );
+        walk_items_for_calls(&mut walker, &file.syntax.items);
     }
     stack.remove(&key);
     saw && ok
 }
 
-fn walk_items_for_calls(
-    ctx: &RuleContext<'_>,
-    items: &[Item],
-    callee: &str,
+struct CallSiteWalker<'a, 'b> {
+    ctx: &'a RuleContext<'b>,
+    callee: &'a str,
     param_index: usize,
     arity: usize,
-    stack: &mut HashSet<(String, usize)>,
-    saw: &mut bool,
-    ok: &mut bool,
-) {
+    stack: &'a mut HashSet<(String, usize)>,
+    saw: &'a mut bool,
+    ok: &'a mut bool,
+}
+
+fn walk_items_for_calls(walker: &mut CallSiteWalker<'_, '_>, items: &[Item]) {
     for item in items {
         match item {
-            Item::Fn(func) => consider_fn(
-                ctx,
-                &func.sig,
-                &func.block,
-                None,
-                callee,
-                param_index,
-                arity,
-                stack,
-                saw,
-                ok,
-            ),
+            Item::Fn(func) => consider_fn(walker, &func.sig, &func.block, None),
+
             Item::Mod(module) => {
                 if let Some((_, nested)) = &module.content {
-                    walk_items_for_calls(ctx, nested, callee, param_index, arity, stack, saw, ok);
+                    walk_items_for_calls(walker, nested);
                 }
             }
+
             Item::Impl(impl_item) => {
                 let impl_name = type_name_of(&impl_item.self_ty);
+
                 for inner in &impl_item.items {
                     let syn::ImplItem::Fn(func) = inner else {
                         continue;
                     };
-                    consider_fn(
-                        ctx,
-                        &func.sig,
-                        &func.block,
-                        impl_name.clone(),
-                        callee,
-                        param_index,
-                        arity,
-                        stack,
-                        saw,
-                        ok,
-                    );
+
+                    consider_fn(walker, &func.sig, &func.block, impl_name.clone());
                 }
             }
+
             _ => {}
         }
     }
 }
 
 fn consider_fn(
-    ctx: &RuleContext<'_>,
+    walker: &mut CallSiteWalker<'_, '_>,
     sig: &syn::Signature,
     block: &syn::Block,
     impl_name: Option<String>,
-    callee: &str,
-    param_index: usize,
-    arity: usize,
-    stack: &mut HashSet<(String, usize)>,
-    saw: &mut bool,
-    ok: &mut bool,
 ) {
     let params = param_names(sig);
     let accounts = extract_context_accounts_struct(sig).or(impl_name);
+
     let mut calls = Vec::new();
     collect_calls(block, &mut calls);
+
     for call in calls {
         let Some(name) = call_last_segment(call) else {
             continue;
         };
-        if name != callee || call.args.len() != arity || param_index >= call.args.len() {
+
+        if name != walker.callee
+            || call.args.len() != walker.arity
+            || walker.param_index >= call.args.len()
+        {
             continue;
         }
-        *saw = true;
+
+        *walker.saw = true;
+
         let proven = argument_is_typed_program(
-            ctx,
-            &call.args[param_index],
+            walker.ctx,
+            &call.args[walker.param_index],
             &params,
             accounts.as_deref(),
             &sig.ident.to_string(),
-            stack,
+            walker.stack,
         );
-        *ok = *ok && proven;
+
+        *walker.ok = *walker.ok && proven;
     }
 }
 
