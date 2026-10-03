@@ -95,8 +95,29 @@ fn checked_cpi_uses_constrained_mint(
     accounts: &AnchorAccountsStruct,
     field: &str,
 ) -> bool {
+    let (proved, blocked, _) = collect_token_cpi(ctx, accounts, field);
+    proved && !blocked
+}
+
+/// SW010. Same CPI proof as SW009. A credit (`to`) needs no signer. A debit
+/// (`from` / `burn`) also needs the CPI authority to be a `Signer` field.
+pub(crate) fn checked_cpi_has_safe_owner(
+    ctx: &RuleContext<'_>,
+    accounts: &AnchorAccountsStruct,
+    field: &str,
+) -> bool {
+    let (proved, blocked, debit_unsigned) = collect_token_cpi(ctx, accounts, field);
+    proved && !blocked && !debit_unsigned
+}
+
+fn collect_token_cpi(
+    ctx: &RuleContext<'_>,
+    accounts: &AnchorAccountsStruct,
+    field: &str,
+) -> (bool, bool, bool) {
     let mut proved = false;
     let mut blocked = false;
+    let mut debit_unsigned = false;
     let map = HashMap::new();
     for file in ctx.files {
         for_each_fn(&file.syntax.items, &mut |sig, block| {
@@ -111,13 +132,15 @@ fn checked_cpi_uses_constrained_mint(
                 in_callee: false,
                 proved: false,
                 blocked: false,
+                debit_unsigned: false,
             };
             walk.visit_block(block);
             proved |= walk.proved;
             blocked |= walk.blocked;
+            debit_unsigned |= walk.debit_unsigned;
         });
     }
-    proved && !blocked
+    (proved, blocked, debit_unsigned)
 }
 
 struct Walk<'a> {
@@ -128,6 +151,8 @@ struct Walk<'a> {
     in_callee: bool,
     proved: bool,
     blocked: bool,
+    /// `from` of a checked CPI whose authority is not a Signer field.
+    debit_unsigned: bool,
 }
 
 impl<'ast> Visit<'ast> for Walk<'_> {
@@ -160,9 +185,10 @@ impl Walk<'_> {
             return;
         }
         match hop(self.ctx, self.accounts, self.field, call) {
-            Some((proved, blocked)) => {
+            Some((proved, blocked, debit_unsigned)) => {
                 self.blocked |= blocked || !proved;
                 self.proved |= proved && !blocked;
+                self.debit_unsigned |= debit_unsigned;
             }
             None => self.blocked = true,
         }
@@ -191,10 +217,28 @@ impl Walk<'_> {
         let mint_ok = struct_field(struct_expr, "mint")
             .and_then(|expr| resolve_field(expr, self.map))
             .is_some_and(|mint| mint_is_constrained(self.accounts, &mint));
-        if mint_ok {
-            self.proved = true;
-        } else {
+        if !mint_ok {
             self.blocked = true;
+            return;
+        }
+        self.proved = true;
+        if self.is_debit(kind, struct_expr)
+            && !authority_is_signer(self.accounts, struct_expr, self.map)
+        {
+            self.debit_unsigned = true;
+        }
+    }
+
+    fn is_debit(&self, kind: TokenOp, struct_expr: &syn::ExprStruct) -> bool {
+        match kind {
+            TokenOp::Burn => true,
+            TokenOp::TransferChecked => {
+                struct_field(struct_expr, "from")
+                    .and_then(|expr| resolve_field(expr, self.map))
+                    .as_deref()
+                    == Some(self.field)
+            }
+            TokenOp::MintTo | TokenOp::Transfer => false,
         }
     }
 
@@ -236,11 +280,12 @@ fn hop(
     accounts: &AnchorAccountsStruct,
     field: &str,
     call: &ExprCall,
-) -> Option<(bool, bool)> {
+) -> Option<(bool, bool, bool)> {
     let name = call_name(call)?;
     let mut found = false;
     let mut proved = true;
     let mut blocked = false;
+    let mut debit_unsigned = false;
     for file in ctx.files {
         for_each_fn(&file.syntax.items, &mut |sig, block| {
             if sig.ident != name {
@@ -268,13 +313,32 @@ fn hop(
                 in_callee: true,
                 proved: false,
                 blocked: false,
+                debit_unsigned: false,
             };
             walk.visit_block(block);
             proved &= walk.proved && !walk.blocked;
             blocked |= walk.blocked || !walk.proved;
+            debit_unsigned |= walk.debit_unsigned;
         });
     }
-    found.then_some((proved, blocked))
+    found.then_some((proved, blocked, debit_unsigned))
+}
+
+fn authority_is_signer(
+    accounts: &AnchorAccountsStruct,
+    struct_expr: &syn::ExprStruct,
+    map: &HashMap<String, String>,
+) -> bool {
+    let Some(name) =
+        struct_field(struct_expr, "authority").and_then(|expr| resolve_field(expr, map))
+    else {
+        return false;
+    };
+    accounts.fields.iter().any(|candidate| {
+        candidate.ast.name.as_deref() == Some(name.as_str())
+            && (candidate.type_info.kind == AnchorFieldTypeKind::Signer
+                || candidate.constraints.is_signer)
+    })
 }
 
 fn mint_is_constrained(accounts: &AnchorAccountsStruct, field: &str) -> bool {
